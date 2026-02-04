@@ -112,7 +112,7 @@ if (!defined('INSTALLING')) {
 }
 ?>
 ```
-Save and Exit (Ctrl+O → Enter → Ctrl+X).
+Save and Exit
 
 ## 4. Database Initialization
 
@@ -157,75 +157,6 @@ Test Registration
 Click "Apply Here" → Create a new user → Ensure redirection to login works.
 
 ## 6. Security Cleanup (Important)
-
-Once the database is initialized and verified, remove the installer script to prevent unauthorized database resets.
-```
-sudo rm /var/www/html/internship_app/install.php
-```
-Response 2
-### Update the "Credentials" section only
-
-```php
-<?php
-// 1. DATABASE CREDENTIALS
-$db_host = "YOUR_DATABASE_ENDPOINT";  // e.g., internship-db.cx7...rds.amazonaws.com
-$db_user = "YOUR_DB_USERNAME";        // e.g., admin
-$db_pass = "YOUR_DB_PASSWORD";        // e.g., secret123
-$db_name = "internship_db";           // Do not change (unless required)
-
-// 2. AUTOMATIC CONNECTION LOGIC
-if (!defined('INSTALLING')) {
-    $conn = new mysqli($db_host, $db_user, $db_pass, $db_name);
-
-    if ($conn->connect_error) {
-        die("<strong>Database Connection Failed:</strong> " . $conn->connect_error . 
-            "<br><em>(Hint: Have you run <a href='install.php'>install.php</a> yet?)</em>");
-    }
-}
-?>
-```
-## 7. Database Initialization
-
-This application includes an Automated Installer (install.php) that creates the required database schema and default admin user. You do not need to manually run SQL commands.
-
-Open your web browser.
-
-Navigate to the installer URL:
-http://<SERVER_IP>/internship_app/install.php
-
-Wait for the script to execute. You should see a success log:
-
-✅ Database check/creation successful.
-
-✅ Table users created.
-
-✅ Table applications created.
-
-✅ Default Admin user created.
-
-Click the link "Go to Login Page" at the bottom.
-
-## 8. Post-Deployment Verification
-
-Perform a smoke test to ensure the deployment is stable.
-
-Access the Login Page
-
-URL: http://<SERVER_IP>/internship_app/
-
-Verify the CloudifyOps logo loads correctly.
-
-Test Admin Login
-
-Username: admin
-
-Password: admin123 (or the hash set in install.php)
-
-Test Registration
-
-Click "Apply Here" → Create a new user → Ensure redirection to login works.
-
-## 9. Security Cleanup (Important)
 
 Once the database is initialized and verified, remove the installer script to prevent unauthorized database resets.
 ```
