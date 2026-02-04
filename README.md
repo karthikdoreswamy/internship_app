@@ -66,19 +66,16 @@ Ensure your project folder contains the following files before uploading:
 ```
 ### B. Deployment Commands
 
-Move the source code to `/var/www/html/internship_app` and set the correct permissions.
+Move the source code to `/var/www/html/` and set the correct permissions.
 
 ```bash
-# 1. Create the application directory
-sudo mkdir -p /var/www/html/internship_app
-
-# 2. Upload/Copy your files to this directory
+# 1. Upload/Copy your files to this directory
 # (Use SCP, FTP, or Git clone depending on your artifact source)
 
-# 3. Set Ownership (Apache User)
-sudo chown -R www-data:www-data /var/www/html/internship_app
+# 2. Set Ownership (Apache User)
+sudo chown -R apache:apache /var/www/html/internship_app
 
-# 4. Set Permissions (Read/Execute for Web, Write for Owner)
+# 3. Set Permissions (Read/Execute for Web, Write for Owner)
 sudo chmod -R 755 /var/www/html/internship_app
 ```
 ## 3. Configuration
