@@ -18,7 +18,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare SSH (POC-safe)
+      - name: Prepare SSH
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
@@ -54,14 +54,14 @@ jobs:
             EFFECTIVE_PASS="$DB_PASS_GOOD"
           fi
 
-          # Create config.php locally (escape PHP $ vars so bash doesn't eat them)
+          # Build config.php locally (escape $ for PHP vars)
           cat > /tmp/config.php <<EOF
           <?php
           \$db_host = "${DB_HOST}";
           \$db_user = "${DB_USER}";
           \$db_pass = "${EFFECTIVE_PASS}";
           \$db_name = "${DB_NAME}";
-          
+
           if (!defined("INSTALLING")) {
             \$conn = new mysqli(\$db_host, \$db_user, \$db_pass, \$db_name);
             if (\$conn->connect_error) {
@@ -72,11 +72,9 @@ jobs:
           ?>
           EOF
 
-          # Upload config.php
           scp -i ~/.ssh/id_rsa /tmp/config.php \
             ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/config.php
 
-          # Install app + move config into place
           ssh -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "sudo bash -lc '
             mkdir -p /var/www/html/internship_app
             rsync -a --delete /tmp/internship_app/ /var/www/html/internship_app/
@@ -85,13 +83,13 @@ jobs:
             chown -R apache:apache /var/www/html/internship_app || true
             chmod -R 755 /var/www/html/internship_app || true
 
-            # Validate config syntax to avoid silent 500
+            # validate php file to avoid silent 500 due to syntax
             php -l /var/www/html/internship_app/config.php
 
             systemctl restart httpd || systemctl restart apache2
           '"
 
-      - name: Smoke test (health) - capture status (do NOT fail here)
+      - name: Smoke test (health) - capture status (do NOT fail immediately)
         id: smoke
         run: |
           set +e
@@ -102,7 +100,7 @@ jobs:
           echo "http_code=$code" >> $GITHUB_OUTPUT
           exit 0
 
-      - name: Fail job if smoke failed (after capture)
+      - name: Fail job if smoke failed
         if: ${{ steps.smoke.outputs.http_code != '200' }}
         run: |
           echo "Smoke test failed with HTTP ${{ steps.smoke.outputs.http_code }}"
@@ -114,70 +112,54 @@ jobs:
     if: ${{ failure() }}
 
     steps:
-      - name: Debug webhook auth (HMAC vs Bearer) with minimal payload
+      - name: Trigger AWS DevOps Agent (Generic Webhook + HMAC)
         env:
           WEBHOOK_URL: ${{ secrets.DEVOPS_AGENT_WEBHOOK_URL }}
           WEBHOOK_SECRET: ${{ secrets.DEVOPS_AGENT_WEBHOOK_SECRET }}
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
         run: |
           set -euo pipefail
 
           TS="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
-          INCIDENT_ID="debug-$(date +%s)"
+          INCIDENT_ID="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
+          # Create payload.json (valid JSON)
           cat > payload.json <<EOF
           {
             "eventType": "incident",
             "incidentId": "${INCIDENT_ID}",
             "action": "created",
             "priority": "HIGH",
-            "title": "Webhook Debug Test",
-            "description": "Testing auth mode",
+            "title": "POC: internship_app deploy/smoke failed",
+            "description": "Repo=${GITHUB_REPOSITORY} Run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} SHA=${GITHUB_SHA} Ref=${GITHUB_REF_NAME}",
             "service": "internship_app",
-            "timestamp": "${TS}"
+            "timestamp": "${TS}",
+            "data": {
+              "aws": {
+                "accountId": "${AWS_ACCOUNT_ID}",
+                "region": "${AWS_REGION}",
+                "instanceId": "${EC2_INSTANCE_ID}"
+              }
+            }
           }
           EOF
 
+          # Validate JSON format (fast fail if broken)
           python -m json.tool payload.json >/dev/null
 
-          # --- HMAC attempt ---
-          SIG="$(printf '%s:%s' "$TS" "$(cat payload.json)" \
+          # IMPORTANT: Sign EXACT bytes that will be sent:
+          # signature = base64(hmac_sha256(secret, "timestamp:" + payload_bytes))
+          SIG="$(
+            { printf '%s:' "$TS"; cat payload.json; } \
             | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary \
-            | base64 | tr -d '\n')"
+            | openssl base64 -A
+          )"
 
-          HMAC_CODE="$(curl -sS -o /tmp/hmac_body.txt -w "%{http_code}" -X POST "$WEBHOOK_URL" \
+          echo "Posting to DevOps Agent webhook..."
+          curl -sS -i -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -H "x-amzn-event-timestamp: ${TS}" \
             -H "x-amzn-event-signature: ${SIG}" \
-            --data-binary @payload.json || true)"
-
-          echo "HMAC HTTP code: ${HMAC_CODE}"
-          echo "HMAC body:"
-          cat /tmp/hmac_body.txt || true
-          echo
-
-          # --- Bearer attempt ---
-          BEARER_CODE="$(curl -sS -o /tmp/bearer_body.txt -w "%{http_code}" -X POST "$WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -H "x-amzn-event-timestamp: ${TS}" \
-            -H "Authorization: Bearer ${WEBHOOK_SECRET}" \
-            --data-binary @payload.json || true)"
-
-          echo "Bearer HTTP code: ${BEARER_CODE}"
-          echo "Bearer body:"
-          cat /tmp/bearer_body.txt || true
-          echo
-
-          if [ "${HMAC_CODE}" = "200" ]; then
-            echo "✅ Your webhook expects HMAC. Keep x-amzn-event-signature."
-            exit 0
-          fi
-
-          if [ "${BEARER_CODE}" = "200" ]; then
-            echo "✅ Your webhook expects Bearer token. Use Authorization: Bearer and remove HMAC signature."
-            exit 0
-          fi
-
-          echo "❌ Neither method returned 200. This strongly indicates URL/secret mismatch (or wrong secret copied)."
-          echo "Sanity: secret length = $(printf '%s' "$WEBHOOK_SECRET" | wc -c)"
-          exit 2
-
+            --data-binary @payload.json
