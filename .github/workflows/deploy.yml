@@ -13,17 +13,22 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    outputs:
+      smoke_http_code: ${{ steps.smoke.outputs.http_code }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Prepare SSH
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
           printf '%s' "${{ secrets.EC2_SSH_KEY }}" | sed 's/\r$//' > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
+
+          # Avoid host key issues in GitHub runner
           cat >> ~/.ssh/config <<'EOF'
           Host *
             StrictHostKeyChecking no
@@ -31,6 +36,7 @@ jobs:
           EOF
 
       - name: Deploy to EC2 (rsync code, exclude config.php)
+        shell: bash
         run: |
           set -euo pipefail
           rsync -az --delete --exclude 'config.php' \
@@ -38,6 +44,7 @@ jobs:
             ./ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/internship_app/
 
       - name: Install to Apache docroot + write config.php
+        shell: bash
         env:
           SIMULATE: ${{ github.event.inputs.simulate_bad_db_pass || 'false' }}
           DB_HOST: ${{ secrets.DB_HOST }}
@@ -54,6 +61,7 @@ jobs:
             EFFECTIVE_PASS="$DB_PASS_GOOD"
           fi
 
+          # Build config.php locally on runner
           cat > /tmp/config.php <<EOF
           <?php
           \$db_host = "${DB_HOST}";
@@ -71,9 +79,11 @@ jobs:
           ?>
           EOF
 
+          # Copy config to EC2 tmp
           scp -i ~/.ssh/id_rsa /tmp/config.php \
             ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/config.php
 
+          # Install and restart apache
           ssh -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "sudo bash -lc '
             set -euo pipefail
             mkdir -p /var/www/html/internship_app
@@ -85,11 +95,12 @@ jobs:
 
             php -l /var/www/html/internship_app/config.php
 
-            systemctl restart httpd || systemctl restart apache2
+            systemctl restart httpd || systemctl restart apache2 || true
           '"
 
       - name: Smoke test (health) - capture status (do NOT fail immediately)
         id: smoke
+        shell: bash
         run: |
           set +e
           url="http://${{ secrets.EC2_HOST }}/internship_app/health.php"
@@ -101,6 +112,7 @@ jobs:
 
       - name: Fail job if smoke failed
         if: ${{ steps.smoke.outputs.http_code != '200' }}
+        shell: bash
         run: |
           echo "Smoke test failed with HTTP ${{ steps.smoke.outputs.http_code }}"
           exit 1
@@ -112,6 +124,7 @@ jobs:
 
     steps:
       - name: Trigger AWS DevOps Agent (Generic Webhook + HMAC) - minimal required details
+        shell: bash
         env:
           WEBHOOK_URL: ${{ secrets.DEVOPS_AGENT_WEBHOOK_URL }}
           WEBHOOK_SECRET: ${{ secrets.DEVOPS_AGENT_WEBHOOK_SECRET }}
@@ -120,6 +133,8 @@ jobs:
           AWS_REGION: ${{ secrets.AWS_REGION }}
           EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
           EC2_HOST: ${{ secrets.EC2_HOST }}
+
+          OBSERVED_HTTP: ${{ needs.deploy.outputs.smoke_http_code }}
         run: |
           set -euo pipefail
 
@@ -127,7 +142,10 @@ jobs:
           INCIDENT_ID="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           ENDPOINT="http://${EC2_HOST}/internship_app/health.php"
+          HTTP="${OBSERVED_HTTP:-unknown}"
 
+          # Put required context in description (always readable)
+          # Also put structured fields under data.metadata (most likely to be consumed)
           cat > payload.json <<EOF
           {
             "eventType": "incident",
@@ -135,20 +153,17 @@ jobs:
             "action": "created",
             "priority": "HIGH",
             "title": "internship_app smoke check failed",
-            "description": "Smoke check failed. endpoint=${ENDPOINT} run=${RUN_URL}",
             "service": "internship_app",
             "timestamp": "${TS}",
+            "description": "Smoke failed. account=${AWS_ACCOUNT_ID} region=${AWS_REGION} resource=ec2:${EC2_INSTANCE_ID} endpoint=${ENDPOINT} observed_http=${HTTP} run=${RUN_URL}",
             "data": {
-              "awsAccountId": "${AWS_ACCOUNT_ID}",
-              "awsRegion": "${AWS_REGION}",
-              "resources": [
-                {
-                  "type": "ec2",
-                  "id": "${EC2_INSTANCE_ID}",
-                  "endpoint": "${ENDPOINT}"
-                }
-              ],
-              "deployment": {
+              "metadata": {
+                "awsAccountId": "${AWS_ACCOUNT_ID}",
+                "awsRegion": "${AWS_REGION}",
+                "resourceType": "ec2",
+                "resourceId": "${EC2_INSTANCE_ID}",
+                "endpoint": "${ENDPOINT}",
+                "observedHttpStatus": "${HTTP}",
                 "pipeline": "github-actions",
                 "runUrl": "${RUN_URL}",
                 "commit": "${GITHUB_SHA}",
@@ -158,8 +173,10 @@ jobs:
           }
           EOF
 
+          # Validate JSON before sending
           python -m json.tool payload.json >/dev/null
 
+          # HMAC signature over EXACT: "${timestamp}:" + raw JSON bytes
           SIG="$(
             { printf '%s:' "$TS"; cat payload.json; } \
             | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary \
