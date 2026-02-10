@@ -54,7 +54,6 @@ jobs:
             EFFECTIVE_PASS="$DB_PASS_GOOD"
           fi
 
-          # Build config.php locally (escape $ for PHP vars)
           cat > /tmp/config.php <<EOF
           <?php
           \$db_host = "${DB_HOST}";
@@ -83,7 +82,6 @@ jobs:
             chown -R apache:apache /var/www/html/internship_app || true
             chmod -R 755 /var/www/html/internship_app || true
 
-            # validate php file to avoid silent 500 due to syntax
             php -l /var/www/html/internship_app/config.php
 
             systemctl restart httpd || systemctl restart apache2
@@ -112,52 +110,65 @@ jobs:
     if: ${{ failure() }}
 
     steps:
-      - name: Trigger AWS DevOps Agent (Generic Webhook + HMAC)
+      - name: Trigger AWS DevOps Agent (Generic Webhook + HMAC) with full AWS context
         env:
           WEBHOOK_URL: ${{ secrets.DEVOPS_AGENT_WEBHOOK_URL }}
           WEBHOOK_SECRET: ${{ secrets.DEVOPS_AGENT_WEBHOOK_SECRET }}
+
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
           EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
           set -euo pipefail
 
           TS="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
           INCIDENT_ID="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          ENDPOINT="http://${EC2_HOST}/internship_app/health.php"
 
-          # Create payload.json (valid JSON)
+          # IMPORTANT: Use "data" to carry the original event details.
+          # Include accountId/region/resources + run metadata + timestamp to avoid follow-up questions.
           cat > payload.json <<EOF
           {
             "eventType": "incident",
             "incidentId": "${INCIDENT_ID}",
             "action": "created",
             "priority": "HIGH",
-            "title": "POC: internship_app deploy/smoke failed",
-            "description": "Repo=${GITHUB_REPOSITORY} Run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} SHA=${GITHUB_SHA} Ref=${GITHUB_REF_NAME}",
+            "title": "POC: internship_app deploy/smoke failed (GitHub Actions)",
+            "description": "Smoke check failed. Run=${RUN_URL} SHA=${GITHUB_SHA} Ref=${GITHUB_REF_NAME}",
             "service": "internship_app",
             "timestamp": "${TS}",
             "data": {
-              "aws": {
-                "accountId": "${AWS_ACCOUNT_ID}",
-                "region": "${AWS_REGION}",
-                "instanceId": "${EC2_INSTANCE_ID}"
+              "accountId": "${AWS_ACCOUNT_ID}",
+              "region": "${AWS_REGION}",
+              "resources": [
+                {
+                  "type": "ec2",
+                  "id": "${EC2_INSTANCE_ID}",
+                  "endpoint": "${ENDPOINT}"
+                }
+              ],
+              "failureTimestamp": "${TS}",
+              "deployment": {
+                "pipeline": "github-actions",
+                "runUrl": "${RUN_URL}",
+                "commit": "${GITHUB_SHA}",
+                "ref": "${GITHUB_REF_NAME}"
               }
             }
           }
           EOF
 
-          # Validate JSON format (fast fail if broken)
           python -m json.tool payload.json >/dev/null
 
-          # IMPORTANT: Sign EXACT bytes that will be sent:
-          # signature = base64(hmac_sha256(secret, "timestamp:" + payload_bytes))
+          # Sign EXACT bytes: "timestamp:" + payload.json bytes
           SIG="$(
             { printf '%s:' "$TS"; cat payload.json; } \
             | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary \
             | openssl base64 -A
           )"
 
-          echo "Posting to DevOps Agent webhook..."
           curl -sS -i -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -H "x-amzn-event-timestamp: ${TS}" \
