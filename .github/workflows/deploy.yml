@@ -32,11 +32,12 @@ jobs:
 
       - name: Deploy to EC2 (rsync code, exclude config.php)
         run: |
+          set -euo pipefail
           rsync -az --delete --exclude 'config.php' \
             -e "ssh -i ~/.ssh/id_rsa" \
             ./ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/internship_app/
 
-      - name: Render config.php locally + upload to EC2
+      - name: Install to Apache docroot + write config.php
         env:
           SIMULATE: ${{ github.event.inputs.simulate_bad_db_pass || 'false' }}
           DB_HOST: ${{ secrets.DB_HOST }}
@@ -53,6 +54,7 @@ jobs:
             EFFECTIVE_PASS="$DB_PASS_GOOD"
           fi
 
+          # Create config.php locally (escape PHP $ vars so bash doesn't eat them)
           cat > /tmp/config.php <<EOF
           <?php
           \$db_host = "${DB_HOST}";
@@ -70,9 +72,11 @@ jobs:
           ?>
           EOF
 
+          # Upload config.php
           scp -i ~/.ssh/id_rsa /tmp/config.php \
             ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/config.php
 
+          # Install app + move config into place
           ssh -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "sudo bash -lc '
             mkdir -p /var/www/html/internship_app
             rsync -a --delete /tmp/internship_app/ /var/www/html/internship_app/
@@ -81,65 +85,24 @@ jobs:
             chown -R apache:apache /var/www/html/internship_app || true
             chmod -R 755 /var/www/html/internship_app || true
 
+            # Validate config syntax to avoid silent 500
             php -l /var/www/html/internship_app/config.php
 
             systemctl restart httpd || systemctl restart apache2
           '"
 
-      # IMPORTANT: do NOT fail here. Capture HTTP code so later steps can run.
-      - name: Smoke test (health) - capture status
+      - name: Smoke test (health) - capture status (do NOT fail here)
         id: smoke
         run: |
           set +e
           url="http://${{ secrets.EC2_HOST }}/internship_app/health.php"
-          echo "Hitting: $url"
           code=$(curl -s -o /tmp/health_body.txt -w "%{http_code}" "$url")
           echo "HTTP_CODE=$code"
           cat /tmp/health_body.txt || true
           echo "http_code=$code" >> $GITHUB_OUTPUT
           exit 0
 
-      - name: Collect EC2 diagnostics (only if smoke failed)
-        if: ${{ steps.smoke.outputs.http_code != '200' }}
-        run: |
-          # Always create the file even if SSH fails, so artifact upload has something
-          {
-            echo "=== github run url ==="
-            echo "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-            echo "=== smoke http code ==="
-            echo "${{ steps.smoke.outputs.http_code }}"
-            echo "=== time (UTC) ==="
-            date -u
-            echo
-            echo "=== EC2 diagnostics ==="
-            ssh -i ~/.ssh/id_rsa \
-              ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "sudo bash -lc '
-                echo \"=== curl localhost health ===\"
-                curl -i http://localhost/internship_app/health.php || true
-
-                echo \"=== config.php head ===\"
-                sed -n \"1,60p\" /var/www/html/internship_app/config.php || true
-
-                echo \"=== php modules (mysqli/pdo_mysql) ===\"
-                php -m | egrep -i \"mysqli|pdo_mysql\" || true
-
-                echo \"=== apache error log tail ===\"
-                tail -n 120 /var/log/httpd/error_log 2>/dev/null || true
-                tail -n 120 /var/log/apache2/error.log 2>/dev/null || true
-
-                echo \"=== php errors tail ===\"
-                tail -n 120 /var/log/php_errors.log 2>/dev/null || true
-              '"
-          } | tee /tmp/ec2_diagnostics.txt
-
-      - name: Upload diagnostics artifact (only if smoke failed)
-        if: ${{ steps.smoke.outputs.http_code != '200' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: ec2-diagnostics
-          path: /tmp/ec2_diagnostics.txt
-
-      - name: Fail job if smoke failed (after evidence collected)
+      - name: Fail job if smoke failed (after capture)
         if: ${{ steps.smoke.outputs.http_code != '200' }}
         run: |
           echo "Smoke test failed with HTTP ${{ steps.smoke.outputs.http_code }}"
@@ -151,85 +114,51 @@ jobs:
     if: ${{ failure() }}
 
     steps:
-      - name: Download diagnostics artifact (if present)
-        uses: actions/download-artifact@v4
-        with:
-          name: ec2-diagnostics
-          path: /tmp/ec2-diagnostics
-
-      - name: Trigger AWS DevOps Agent via webhook
+      - name: Trigger AWS DevOps Agent (generic webhook, minimal AWS context)
         env:
           WEBHOOK_URL: ${{ secrets.DEVOPS_AGENT_WEBHOOK_URL }}
           WEBHOOK_SECRET: ${{ secrets.DEVOPS_AGENT_WEBHOOK_SECRET }}
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
-          TARGET_RESOURCE_TYPE: ec2
-          TARGET_RESOURCE_ID: ${{ secrets.TARGET_RESOURCE_ID }}
-          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
         run: |
           set -euo pipefail
 
           TS="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
           INCIDENT_ID="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
-          # Artifact typically downloads into /tmp/ec2-diagnostics/ec2_diagnostics.txt
-          DIAG_FILE="$(find /tmp/ec2-diagnostics -type f -name 'ec2_diagnostics.txt' 2>/dev/null | head -n 1 || true)"
-
-          if [ -n "${DIAG_FILE}" ] && [ -f "${DIAG_FILE}" ]; then
-            DIAG="$(sed 's/"/\\"/g' "${DIAG_FILE}" | tail -n 2000 | tr '\n' '\\n')"
-          else
-            DIAG="(no diagnostics file found under /tmp)"
-          fi
-
-          if [ -z "${TARGET_RESOURCE_ID}" ]; then
-            echo "ERROR: TARGET_RESOURCE_ID is empty. Set GitHub secret EC2_INSTANCE_ID."
-            exit 2
-          fi
-
-          set -euo pipefail
-          
-          TS="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
-          INCIDENT_ID="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          
-          # Build PAYLOAD first (must be set before SIG)
-          PAYLOAD="$(cat <<EOF
+          # Minimal valid JSON payload (only AWS account/region/instanceId added)
+          cat > payload.json <<EOF
           {
             "eventType": "incident",
             "incidentId": "${INCIDENT_ID}",
             "action": "created",
             "priority": "HIGH",
-            "title": "POC: internship_app deploy/smoke failed (GitHub Actions)",
+            "title": "POC: internship_app deploy/smoke failed",
             "description": "Repo=${GITHUB_REPOSITORY} Run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} SHA=${GITHUB_SHA} Ref=${GITHUB_REF_NAME}",
             "service": "internship_app",
             "timestamp": "${TS}",
             "data": {
-              "metadata": {
+              "aws": {
                 "accountId": "${AWS_ACCOUNT_ID}",
                 "region": "${AWS_REGION}",
-                "resourceType": "${TARGET_RESOURCE_TYPE}",
-                "resourceId": "${TARGET_RESOURCE_ID}",
-                "endpoint": "http://${EC2_HOST}/internship_app/health.php",
-                "repo": "${GITHUB_REPOSITORY}",
-                "ref": "${GITHUB_REF_NAME}",
-                "sha": "${GITHUB_SHA}",
-                "run_id": "${GITHUB_RUN_ID}"
-              },
-              "evidence": {
-                "ec2Diagnostics": "${DIAG:-"(no diag)"}"
+                "instanceId": "${EC2_INSTANCE_ID}"
               }
             }
           }
           EOF
-          )"
-          
-          # IMPORTANT: compute SIG after PAYLOAD exists
-          SIG="$(printf "%s:%s" "$TS" "$PAYLOAD" \
+
+          # Validate JSON
+          python -m json.tool payload.json >/dev/null
+
+          # HMAC signature: base64(hmac_sha256(secret, timestamp + ":" + payload))
+          SIG="$(printf '%s:%s' "$TS" "$(cat payload.json)" \
             | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary \
-            | openssl base64 -A)"
-          
+            | base64 | tr -d '\n')"
+
           echo "Posting to webhook..."
           curl -sS -i -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -H "x-amzn-event-timestamp: ${TS}" \
             -H "x-amzn-event-signature: ${SIG}" \
-            -d "$PAYLOAD"
+            --data-binary @payload.json
