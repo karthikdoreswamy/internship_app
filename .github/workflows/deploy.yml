@@ -164,7 +164,7 @@ jobs:
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
           TARGET_RESOURCE_TYPE: ec2
-          TARGET_RESOURCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+          TARGET_RESOURCE_ID: ${{ secrets.TARGET_RESOURCE_ID }}
           EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
           set -euo pipefail
