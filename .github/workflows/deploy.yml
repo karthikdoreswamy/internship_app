@@ -6,7 +6,7 @@ on:
       simulate_bad_db_pass:
         description: "Set true to break DB_PASS and simulate incident"
         required: true
-        default: "true"
+        default: "false"
   push:
     branches: ["main"]
 
