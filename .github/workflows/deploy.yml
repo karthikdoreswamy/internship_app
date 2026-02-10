@@ -93,40 +93,62 @@ jobs:
             systemctl restart httpd || systemctl restart apache2
           '"
 
-      - name: Smoke test (health)
+      - name: Smoke test (health) - capture status (do NOT fail here)
+        id: smoke
         run: |
-          # Print response for debugging + fail on non-200
-          curl -i "http://${{ secrets.EC2_HOST }}/internship_app/health.php"
-          curl -sS -f "http://${{ secrets.EC2_HOST }}/internship_app/health.php"
+          set +e
+          url="http://${{ secrets.EC2_HOST }}/internship_app/health.php"
+          echo "Hitting: $url"
 
-      - name: Collect EC2 diagnostics (only if failed)
-        if: ${{ failure() }}
+          # Capture HTTP code + body for later debugging
+          code=$(curl -s -o /tmp/health_body.txt -w "%{http_code}" "$url")
+          echo "HTTP_CODE=$code"
+          cat /tmp/health_body.txt || true
+
+          # expose to later steps
+          echo "http_code=$code" >> $GITHUB_OUTPUT
+
+          # Always exit 0 here so we can run diagnostics + upload artifact
+          exit 0
+
+      - name: Collect EC2 diagnostics (only if smoke failed)
+        if: ${{ steps.smoke.outputs.http_code != '200' }}
         run: |
           ssh -i ~/.ssh/id_rsa \
             ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "sudo bash -lc '
-              echo \"=== time ===\"
+              echo \"=== time (UTC) ===\"
               date -u
-      
+
               echo \"=== curl localhost health ===\"
               curl -i http://localhost/internship_app/health.php || true
-      
+
+              echo \"=== config.php head ===\"
+              sed -n \"1,60p\" /var/www/html/internship_app/config.php || true
+
+              echo \"=== php modules (mysqli/pdo_mysql) ===\"
+              php -m | egrep -i \"mysqli|pdo_mysql\" || true
+
               echo \"=== apache error log tail ===\"
               tail -n 120 /var/log/httpd/error_log 2>/dev/null || true
               tail -n 120 /var/log/apache2/error.log 2>/dev/null || true
-      
+
               echo \"=== php errors tail ===\"
               tail -n 120 /var/log/php_errors.log 2>/dev/null || true
-      
-              echo \"=== config.php (first 40 lines) ===\"
-              sed -n \"1,40p\" /var/www/html/internship_app/config.php 2>/dev/null || true
             '" | tee /tmp/ec2_diagnostics.txt
-            
-      - name: Upload diagnostics artifact
-        if: ${{ failure() }}
+
+      - name: Upload diagnostics artifact (only if smoke failed)
+        if: ${{ steps.smoke.outputs.http_code != '200' }}
         uses: actions/upload-artifact@v4
         with:
           name: ec2-diagnostics
           path: /tmp/ec2_diagnostics.txt
+
+      - name: Fail job if smoke test failed (after evidence collected)
+        if: ${{ steps.smoke.outputs.http_code != '200' }}
+        run: |
+          echo "Smoke test failed with HTTP ${{ steps.smoke.outputs.http_code }}"
+          exit 1
+
 
   trigger_devops_agent:
     runs-on: ubuntu-latest
