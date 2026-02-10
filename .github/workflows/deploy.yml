@@ -155,7 +155,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ec2-diagnostics
-          path: /tmp
+          path: /tmp/ec2-diagnostics
 
       - name: Trigger AWS DevOps Agent via webhook
         env:
@@ -173,7 +173,7 @@ jobs:
           INCIDENT_ID="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
           # Artifact typically downloads into /tmp/ec2-diagnostics/ec2_diagnostics.txt
-          DIAG_FILE="$(find /tmp -maxdepth 4 -type f -name 'ec2_diagnostics.txt' | head -n 1 || true)"
+          DIAG_FILE="$(find /tmp/ec2-diagnostics -type f -name 'ec2_diagnostics.txt' 2>/dev/null | head -n 1 || true)"
 
           if [ -n "${DIAG_FILE}" ] && [ -f "${DIAG_FILE}" ]; then
             DIAG="$(sed 's/"/\\"/g' "${DIAG_FILE}" | tail -n 2000 | tr '\n' '\\n')"
