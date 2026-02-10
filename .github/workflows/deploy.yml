@@ -132,29 +132,35 @@ jobs:
           cat > payload.json <<EOF
           {
             "eventType": "incident",
-            "incidentId": "${INCIDENT_ID}",
+            "incidentId": "github-<runid>-<attempt>",
             "action": "created",
             "priority": "HIGH",
-            "title": "POC: internship_app deploy/smoke failed (GitHub Actions)",
-            "description": "Smoke check failed. Run=${RUN_URL} SHA=${GITHUB_SHA} Ref=${GITHUB_REF_NAME}",
+            "title": "internship_app deploy/smoke failed",
+            "description": "Smoke check failed on /internship_app/health.php",
             "service": "internship_app",
-            "timestamp": "${TS}",
+            "timestamp": "2026-02-10T07:19:47.000Z",
             "data": {
-              "accountId": "${AWS_ACCOUNT_ID}",
-              "region": "${AWS_REGION}",
+              "awsAccountId": "123456789012",
+              "awsRegion": "us-east-1",
               "resources": [
                 {
                   "type": "ec2",
-                  "id": "${EC2_INSTANCE_ID}",
-                  "endpoint": "${ENDPOINT}"
+                  "id": "i-0123456789abcdef0",
+                  "endpoint": "http://<ec2-host>/internship_app/health.php"
                 }
               ],
-              "failureTimestamp": "${TS}",
+              "smokeTest": {
+                "type": "http",
+                "method": "GET",
+                "url": "http://<ec2-host>/internship_app/health.php",
+                "expectedHttpStatus": 200,
+                "observedHttpStatus": 500
+              },
               "deployment": {
                 "pipeline": "github-actions",
-                "runUrl": "${RUN_URL}",
-                "commit": "${GITHUB_SHA}",
-                "ref": "${GITHUB_REF_NAME}"
+                "runUrl": "https://github.com/<org>/<repo>/actions/runs/<runid>",
+                "commit": "<sha>",
+                "ref": "main"
               }
             }
           }
