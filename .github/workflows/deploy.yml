@@ -114,51 +114,70 @@ jobs:
     if: ${{ failure() }}
 
     steps:
-      - name: Trigger AWS DevOps Agent (generic webhook, minimal AWS context)
+      - name: Debug webhook auth (HMAC vs Bearer) with minimal payload
         env:
           WEBHOOK_URL: ${{ secrets.DEVOPS_AGENT_WEBHOOK_URL }}
           WEBHOOK_SECRET: ${{ secrets.DEVOPS_AGENT_WEBHOOK_SECRET }}
-          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
         run: |
           set -euo pipefail
 
           TS="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
-          INCIDENT_ID="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          INCIDENT_ID="debug-$(date +%s)"
 
-          # Minimal valid JSON payload (only AWS account/region/instanceId added)
           cat > payload.json <<EOF
           {
             "eventType": "incident",
             "incidentId": "${INCIDENT_ID}",
             "action": "created",
             "priority": "HIGH",
-            "title": "POC: internship_app deploy/smoke failed",
-            "description": "Repo=${GITHUB_REPOSITORY} Run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} SHA=${GITHUB_SHA} Ref=${GITHUB_REF_NAME}",
+            "title": "Webhook Debug Test",
+            "description": "Testing auth mode",
             "service": "internship_app",
-            "timestamp": "${TS}",
-            "data": {
-              "aws": {
-                "accountId": "${AWS_ACCOUNT_ID}",
-                "region": "${AWS_REGION}",
-                "instanceId": "${EC2_INSTANCE_ID}"
-              }
-            }
+            "timestamp": "${TS}"
           }
           EOF
 
-          # Validate JSON
           python -m json.tool payload.json >/dev/null
 
-          # HMAC signature: base64(hmac_sha256(secret, timestamp + ":" + payload))
+          # --- HMAC attempt ---
           SIG="$(printf '%s:%s' "$TS" "$(cat payload.json)" \
             | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary \
             | base64 | tr -d '\n')"
 
-          echo "Posting to webhook..."
-          curl -sS -i -X POST "$WEBHOOK_URL" \
+          HMAC_CODE="$(curl -sS -o /tmp/hmac_body.txt -w "%{http_code}" -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -H "x-amzn-event-timestamp: ${TS}" \
             -H "x-amzn-event-signature: ${SIG}" \
-            --data-binary @payload.json
+            --data-binary @payload.json || true)"
+
+          echo "HMAC HTTP code: ${HMAC_CODE}"
+          echo "HMAC body:"
+          cat /tmp/hmac_body.txt || true
+          echo
+
+          # --- Bearer attempt ---
+          BEARER_CODE="$(curl -sS -o /tmp/bearer_body.txt -w "%{http_code}" -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "x-amzn-event-timestamp: ${TS}" \
+            -H "Authorization: Bearer ${WEBHOOK_SECRET}" \
+            --data-binary @payload.json || true)"
+
+          echo "Bearer HTTP code: ${BEARER_CODE}"
+          echo "Bearer body:"
+          cat /tmp/bearer_body.txt || true
+          echo
+
+          if [ "${HMAC_CODE}" = "200" ]; then
+            echo "✅ Your webhook expects HMAC. Keep x-amzn-event-signature."
+            exit 0
+          fi
+
+          if [ "${BEARER_CODE}" = "200" ]; then
+            echo "✅ Your webhook expects Bearer token. Use Authorization: Bearer and remove HMAC signature."
+            exit 0
+          fi
+
+          echo "❌ Neither method returned 200. This strongly indicates URL/secret mismatch (or wrong secret copied)."
+          echo "Sanity: secret length = $(printf '%s' "$WEBHOOK_SECRET" | wc -c)"
+          exit 2
+
