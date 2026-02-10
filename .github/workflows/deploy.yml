@@ -18,18 +18,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare SSH
+      - name: Prepare SSH (POC-safe)
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
-          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+          printf '%s' "${{ secrets.EC2_SSH_KEY }}" | sed 's/\r$//' > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+          # POC: avoid host key scan issues
+          cat >> ~/.ssh/config <<'EOF'
+          Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+          EOF
 
-      - name: Deploy to EC2 (rsync)
+      - name: Deploy to EC2 (rsync code, exclude config.php)
         run: |
-          rsync -az --delete ./ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/internship_app/
+          rsync -az --delete --exclude 'config.php' \
+            -e "ssh -i ~/.ssh/id_rsa" \
+            ./ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/internship_app/
 
-      - name: Install to Apache docroot + write config.php
+      - name: Render config.php locally + upload to EC2
         env:
           SIMULATE: ${{ github.event.inputs.simulate_bad_db_pass || 'false' }}
           DB_HOST: ${{ secrets.DB_HOST }}
@@ -38,39 +46,57 @@ jobs:
           DB_PASS_BAD: ${{ secrets.DB_PASS_BAD }}
           DB_NAME: ${{ secrets.DB_NAME }}
         run: |
+          set -euo pipefail
+
           if [ "$SIMULATE" = "true" ]; then
             EFFECTIVE_PASS="$DB_PASS_BAD"
           else
             EFFECTIVE_PASS="$DB_PASS_GOOD"
           fi
 
-          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "sudo bash -lc '
+          # Create config.php LOCALLY (do not let bash expand PHP $vars)
+          cat > /tmp/config.php <<EOF
+          <?php
+          // 1. DATABASE CREDENTIALS
+          \$db_host = "${DB_HOST}";
+          \$db_user = "${DB_USER}";
+          \$db_pass = "${EFFECTIVE_PASS}";
+          \$db_name = "${DB_NAME}";
+          
+          // 2. AUTOMATIC CONNECTION LOGIC
+          if (!defined("INSTALLING")) {
+            \$conn = new mysqli(\$db_host, \$db_user, \$db_pass, \$db_name);
+            if (\$conn->connect_error) {
+              http_response_code(500);
+              die("DB Connection Failed: " . \$conn->connect_error);
+            }
+          }
+          ?>
+          EOF
+
+          # Upload config.php
+          scp -i ~/.ssh/id_rsa /tmp/config.php \
+            ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/config.php
+
+          # Install to Apache docroot and restart
+          ssh -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "sudo bash -lc '
             mkdir -p /var/www/html/internship_app
             rsync -a --delete /tmp/internship_app/ /var/www/html/internship_app/
 
-            cat > /var/www/html/internship_app/config.php <<EOF
-            <?php
-            \$db_host = \"${DB_HOST}\";
-            \$db_user = \"${DB_USER}\";
-            \$db_pass = \"${EFFECTIVE_PASS}\";
-            \$db_name = \"${DB_NAME}\";
-            if (!defined(\"INSTALLING\")) {
-              \$conn = new mysqli(\$db_host, \$db_user, \$db_pass, \$db_name);
-              if (\$conn->connect_error) {
-                http_response_code(500);
-                die(\"DB Connection Failed: \" . \$conn->connect_error);
-              }
-            }
-            ?>
-          EOF
-
+            mv /tmp/config.php /var/www/html/internship_app/config.php
             chown -R apache:apache /var/www/html/internship_app || true
             chmod -R 755 /var/www/html/internship_app || true
+
+            # Fail fast if config.php is syntactically broken
+            php -l /var/www/html/internship_app/config.php
+
             systemctl restart httpd || systemctl restart apache2
           '"
 
       - name: Smoke test (health)
         run: |
+          # Print response for debugging + fail on non-200
+          curl -i "http://${{ secrets.EC2_HOST }}/internship_app/health.php"
           curl -sS -f "http://${{ secrets.EC2_HOST }}/internship_app/health.php"
 
   trigger_devops_agent:
