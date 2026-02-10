@@ -193,40 +193,34 @@ jobs:
             "action": "created",
             "priority": "HIGH",
             "title": "POC: internship_app deploy/smoke failed (GitHub Actions)",
-            "description": "Workflow failed. Repo=${GITHUB_REPOSITORY}, Run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}, SHA=${GITHUB_SHA}, Ref=${GITHUB_REF_NAME}",
+            "description": "Repo=${GITHUB_REPOSITORY} Run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} SHA=${GITHUB_SHA} Ref=${GITHUB_REF_NAME}",
             "service": "internship_app",
             "timestamp": "${TS}",
-            "aws": {
-              "accountId": "${AWS_ACCOUNT_ID}",
-              "region": "${AWS_REGION}",
-              "resources": [
-                {
-                  "type": "${TARGET_RESOURCE_TYPE}",
-                  "id": "${TARGET_RESOURCE_ID}",
-                  "endpoint": "http://${EC2_HOST}/internship_app/health.php"
-                }
-              ]
-            },
-            "deployment": {
-              "pipeline": "github-actions",
-              "runUrl": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}",
-              "commit": "${GITHUB_SHA}",
-              "ref": "${GITHUB_REF_NAME}"
-            },
-            "evidence": {
-              "ec2Diagnostics": "${DIAG}"
-            },
-            "tags": {
-              "repo": "${GITHUB_REPOSITORY}",
-              "ref": "${GITHUB_REF_NAME}",
-              "sha": "${GITHUB_SHA}",
-              "run_id": "${GITHUB_RUN_ID}"
+            "data": {
+              "metadata": {
+                "region": "${AWS_REGION}",
+                "accountId": "${AWS_ACCOUNT_ID}",
+                "resourceType": "${TARGET_RESOURCE_TYPE}",
+                "resourceId": "${TARGET_RESOURCE_ID}",
+                "endpoint": "http://${EC2_HOST}/internship_app/health.php",
+                "repo": "${GITHUB_REPOSITORY}",
+                "ref": "${GITHUB_REF_NAME}",
+                "sha": "${GITHUB_SHA}",
+                "run_id": "${GITHUB_RUN_ID}"
+              },
+              "deployment": {
+                "pipeline": "github-actions",
+                "runUrl": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+              },
+              "evidence": {
+                "ec2Diagnostics": "${DIAG}"
+              }
             }
           }
           EOF
           )"
 
-          SIG="$(printf "%s:%s" "$TS" "$PAYLOAD" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | openssl base64 -A)"
+          SIGNATURE=$(echo -n "${TS}:${PAYLOAD}" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | base64)
 
           curl -sS -i -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
