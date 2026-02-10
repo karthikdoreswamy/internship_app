@@ -75,6 +75,7 @@ jobs:
             ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/config.php
 
           ssh -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "sudo bash -lc '
+            set -euo pipefail
             mkdir -p /var/www/html/internship_app
             rsync -a --delete /tmp/internship_app/ /var/www/html/internship_app/
 
@@ -110,7 +111,7 @@ jobs:
     if: ${{ failure() }}
 
     steps:
-      - name: Trigger AWS DevOps Agent (Generic Webhook + HMAC) with full AWS context
+      - name: Trigger AWS DevOps Agent (Generic Webhook + HMAC) - minimal required details
         env:
           WEBHOOK_URL: ${{ secrets.DEVOPS_AGENT_WEBHOOK_URL }}
           WEBHOOK_SECRET: ${{ secrets.DEVOPS_AGENT_WEBHOOK_SECRET }}
@@ -127,21 +128,31 @@ jobs:
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           ENDPOINT="http://${EC2_HOST}/internship_app/health.php"
 
-          # IMPORTANT: Use "data" to carry the original event details.
-          # Include accountId/region/resources + run metadata + timestamp to avoid follow-up questions.
           cat > payload.json <<EOF
           {
             "eventType": "incident",
-            "incidentId": "github-<runid>-<attempt>",
+            "incidentId": "${INCIDENT_ID}",
             "action": "created",
             "priority": "HIGH",
-            "title": "internship_app deploy/smoke failed",
-            "description": "Smoke check failed on /internship_app/health.php",
+            "title": "internship_app smoke check failed",
+            "description": "Smoke check failed. endpoint=${ENDPOINT} run=${RUN_URL}",
             "service": "internship_app",
-            "timestamp": "2026-02-10T07:19:47.000Z",
+            "timestamp": "${TS}",
             "data": {
-              "awsAccountId": "123456789012",
-              "awsRegion": "us-east-1",
+              "awsAccountId": "${AWS_ACCOUNT_ID}",
+              "awsRegion": "${AWS_REGION}",
+              "resources": [
+                {
+                  "type": "ec2",
+                  "id": "${EC2_INSTANCE_ID}",
+                  "endpoint": "${ENDPOINT}"
+                }
+              ],
+              "deployment": {
+                "pipeline": "github-actions",
+                "runUrl": "${RUN_URL}",
+                "commit": "${GITHUB_SHA}",
+                "ref": "${GITHUB_REF_NAME}"
               }
             }
           }
@@ -149,7 +160,6 @@ jobs:
 
           python -m json.tool payload.json >/dev/null
 
-          # Sign EXACT bytes: "timestamp:" + payload.json bytes
           SIG="$(
             { printf '%s:' "$TS"; cat payload.json; } \
             | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary \
