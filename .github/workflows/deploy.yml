@@ -6,7 +6,7 @@ on:
       simulate_bad_db_pass:
         description: "Set true to break DB_PASS and simulate incident"
         required: true
-        default: "false"
+        default: "true"
   push:
     branches: ["main"]
 
@@ -186,6 +186,12 @@ jobs:
             exit 2
           fi
 
+          set -euo pipefail
+          
+          TS="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+          INCIDENT_ID="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          
+          # Build PAYLOAD first (must be set before SIG)
           PAYLOAD="$(cat <<EOF
           {
             "eventType": "incident",
@@ -198,8 +204,8 @@ jobs:
             "timestamp": "${TS}",
             "data": {
               "metadata": {
-                "region": "${AWS_REGION}",
                 "accountId": "${AWS_ACCOUNT_ID}",
+                "region": "${AWS_REGION}",
                 "resourceType": "${TARGET_RESOURCE_TYPE}",
                 "resourceId": "${TARGET_RESOURCE_ID}",
                 "endpoint": "http://${EC2_HOST}/internship_app/health.php",
@@ -208,20 +214,20 @@ jobs:
                 "sha": "${GITHUB_SHA}",
                 "run_id": "${GITHUB_RUN_ID}"
               },
-              "deployment": {
-                "pipeline": "github-actions",
-                "runUrl": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-              },
               "evidence": {
-                "ec2Diagnostics": "${DIAG}"
+                "ec2Diagnostics": "${DIAG:-"(no diag)"}"
               }
             }
           }
           EOF
           )"
-
-          SIGNATURE=$(echo -n "${TS}:${PAYLOAD}" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | base64)
-
+          
+          # IMPORTANT: compute SIG after PAYLOAD exists
+          SIG="$(printf "%s:%s" "$TS" "$PAYLOAD" \
+            | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary \
+            | openssl base64 -A)"
+          
+          echo "Posting to webhook..."
           curl -sS -i -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -H "x-amzn-event-timestamp: ${TS}" \
