@@ -142,25 +142,6 @@ jobs:
             "data": {
               "awsAccountId": "123456789012",
               "awsRegion": "us-east-1",
-              "resources": [
-                {
-                  "type": "ec2",
-                  "id": "i-0123456789abcdef0",
-                  "endpoint": "http://<ec2-host>/internship_app/health.php"
-                }
-              ],
-              "smokeTest": {
-                "type": "http",
-                "method": "GET",
-                "url": "http://<ec2-host>/internship_app/health.php",
-                "expectedHttpStatus": 200,
-                "observedHttpStatus": 500
-              },
-              "deployment": {
-                "pipeline": "github-actions",
-                "runUrl": "https://github.com/<org>/<repo>/actions/runs/<runid>",
-                "commit": "<sha>",
-                "ref": "main"
               }
             }
           }
