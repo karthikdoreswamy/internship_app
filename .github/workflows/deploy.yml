@@ -1,0 +1,117 @@
+name: Deploy internship_app + Trigger DevOps Agent on Failure
+
+on:
+  workflow_dispatch:
+    inputs:
+      simulate_bad_db_pass:
+        description: "Set true to break DB_PASS and simulate incident"
+        required: true
+        default: "false"
+  push:
+    branches: ["main"]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy to EC2 (rsync)
+        run: |
+          rsync -az --delete ./ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/internship_app/
+
+      - name: Install to Apache docroot + write config.php
+        env:
+          SIMULATE: ${{ github.event.inputs.simulate_bad_db_pass || 'false' }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS_GOOD: ${{ secrets.DB_PASS_GOOD }}
+          DB_PASS_BAD: ${{ secrets.DB_PASS_BAD }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+        run: |
+          if [ "$SIMULATE" = "true" ]; then
+            EFFECTIVE_PASS="$DB_PASS_BAD"
+          else
+            EFFECTIVE_PASS="$DB_PASS_GOOD"
+          fi
+
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "sudo bash -lc '
+            mkdir -p /var/www/html/internship_app
+            rsync -a --delete /tmp/internship_app/ /var/www/html/internship_app/
+
+            cat > /var/www/html/internship_app/config.php <<EOF
+            <?php
+            \$db_host = \"${DB_HOST}\";
+            \$db_user = \"${DB_USER}\";
+            \$db_pass = \"${EFFECTIVE_PASS}\";
+            \$db_name = \"${DB_NAME}\";
+            if (!defined(\"INSTALLING\")) {
+              \$conn = new mysqli(\$db_host, \$db_user, \$db_pass, \$db_name);
+              if (\$conn->connect_error) {
+                http_response_code(500);
+                die(\"DB Connection Failed: \" . \$conn->connect_error);
+              }
+            }
+            ?>
+          EOF
+
+            chown -R apache:apache /var/www/html/internship_app || true
+            chmod -R 755 /var/www/html/internship_app || true
+            systemctl restart httpd || systemctl restart apache2
+          '"
+
+      - name: Smoke test (health)
+        run: |
+          curl -sS -f "http://${{ secrets.EC2_HOST }}/internship_app/health.php"
+
+  trigger_devops_agent:
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: ${{ failure() }}
+
+    steps:
+      - name: Trigger AWS DevOps Agent via webhook
+        env:
+          WEBHOOK_URL: ${{ secrets.DEVOPS_AGENT_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.DEVOPS_AGENT_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          TS="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+          INCIDENT_ID="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          PAYLOAD="$(cat <<EOF
+          {
+            "eventType": "incident",
+            "incidentId": "${INCIDENT_ID}",
+            "action": "created",
+            "priority": "HIGH",
+            "title": "POC: internship_app deploy/smoke failed (GitHub Actions)",
+            "description": "Workflow failed. Repo=${GITHUB_REPOSITORY}, Run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}, SHA=${GITHUB_SHA}, Ref=${GITHUB_REF_NAME}",
+            "service": "internship_app",
+            "timestamp": "${TS}",
+            "tags": {
+              "repo": "${GITHUB_REPOSITORY}",
+              "ref": "${GITHUB_REF_NAME}",
+              "sha": "${GITHUB_SHA}",
+              "run_id": "${GITHUB_RUN_ID}"
+            }
+          }
+          EOF
+          )"
+
+          SIG="$(printf "%s:%s" "$TS" "$PAYLOAD" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | openssl base64 -A)"
+
+          curl -sS -i -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "x-amzn-event-timestamp: ${TS}" \
+            -H "x-amzn-event-signature: ${SIG}" \
+            -d "$PAYLOAD"
